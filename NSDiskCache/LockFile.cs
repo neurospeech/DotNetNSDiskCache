@@ -1,4 +1,4 @@
-﻿namespace NSDiskCache;
+﻿namespace NeuroSpeech.NSDiskCache;
 
 using System;
 using System.IO;
@@ -36,11 +36,11 @@ public class LockFile : IDisposable
 
         using var sha256 = SHA256.Create();
         var hashBytes = sha256.ComputeHash(System.Text.Encoding.UTF8.GetBytes(someKey));
-        var hash = BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();
+        var hash = Convert.ToHexString(hashBytes);
         var lockFile = Path.Combine(LockFolder, $"{hash}.lock");
 
         var till = DateTime.UtcNow.AddMilliseconds(timeout);
-        Exception lastError = null;
+        Exception? lastError = null;
 
         while (DateTime.UtcNow < till)
         {
@@ -74,7 +74,7 @@ public class LockFile : IDisposable
         return new LockFilePlaceholder();
     }
 
-    private void UpdateTimestamp(object _)
+    private void UpdateTimestamp(object? _)
     {
         try
         {

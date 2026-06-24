@@ -1,13 +1,6 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Security.Cryptography;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-using static System.Runtime.InteropServices.JavaScript.JSType;
+﻿using System.Security.Cryptography;
 
-namespace NSDiskCache;
+namespace NeuroSpeech.NSDiskCache;
 
 public class DiskCacheOptions
 {
@@ -21,6 +14,14 @@ public class DiskCacheOptions
     public int MinAge { get; set; }
 
     public int MaxAge { get; set; }
+
+    public DiskCacheOptions()
+    {
+        this.KeepTTLSeconds = 3600;
+        this.MinSize = long.MaxValue;
+        this.MinAge = 1;
+        this.MaxAge = 4;
+    }
 
 }
 
@@ -54,9 +55,9 @@ public class BaseDiskCache
         {
             throw new ArgumentException($"MinAge cannot be less than zero");
         }
-        if (options.MaxAge < 0)
+        if (options.MaxAge < this.Options.MinAge)
         {
-            throw new ArgumentException($"MaxAge cannot be less than zero");
+            throw new ArgumentException($"MaxAge cannot be less than MinAge");
         }
         if (this.Options.Root == null)
         {
@@ -123,37 +124,40 @@ public class BaseDiskCache
 
         try
         {
-            var start = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+            var start = DateTime.UtcNow;
             long total = 0;
 
             var min = this.Options.MinAge;
 
-            List<(DateTime time, string path, long size)>? all = null;
+            List<(DateTime time, FileInfo file, long size)>? all = null;
             long freeSize = 0;
             int deleted = 0;
 
             for (int i = this.Options.MaxAge; i >= min; i--)
             {
-                var s = await this.GetFileSystemStatsAsync(this.Options.Root);
-                freeSize = s.Bavail * s.Bsize;
 
-                if (freeSize >= this.Options.MinSize)
+                var rootDir = new DirectoryInfo(this.Options.Root);
+                var drive = new DriveInfo(rootDir.Root.FullName);
+
+                if (freeSize >= drive.TotalFreeSpace)
                 {
                     break;
                 }
 
-                all ??= await this.GetFileStatsAsync();
+                await Task.Delay(100);
+
+                all ??= this.GetFileStatsAsync();
 
                 try
                 {
-                    var keep = DateTime.Now.AddSeconds(-this.Options.KeepTTLSeconds * i);
-                    var pending = new List<(DateTime time, string path, long size)>();
+                    var keep = DateTime.UtcNow.AddSeconds(-this.Options.KeepTTLSeconds * i);
+                    var pending = new List<(DateTime time, FileInfo file, long size)>();
 
                     foreach (var file in all)
                     {
                         if (file.time < keep)
                         {
-                            File.Delete(file.path);
+                            DeletePath(file.file);
                             deleted++;
                             total += file.size;
                             continue;
@@ -176,7 +180,7 @@ public class BaseDiskCache
 
             if (total > 0)
             {
-                Console.WriteLine($"{this.Options.Root} ({deleted}/{all?.Count + deleted}) cleaned, {total.ToKMBString()} freed in {DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - start}ms.");
+                Console.WriteLine($"{this.Options.Root} ({deleted}/{all?.Count + deleted}) cleaned, {total.ToKMBString()} freed in {(DateTime.UtcNow - start).TotalMilliseconds}ms.");
             }
             else
             {
@@ -184,11 +188,11 @@ public class BaseDiskCache
                 {
                     if (this.Options.MinSize == long.MaxValue)
                     {
-                        Console.WriteLine($"Cleaning {this.Options.Root} with entries ({all.Count}) for {DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - start}ms.");
+                        Console.WriteLine($"Cleaning {this.Options.Root} with entries ({all.Count}) for {(DateTime.UtcNow - start).TotalMilliseconds}ms.");
                     }
                     else
                     {
-                        Console.WriteLine($"Cleaning {this.Options.Root} with entries ({all.Count}) for {DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - start}ms as {freeSize.ToKMBString()} < {this.Options.MinSize.ToKMBString()}.");
+                        Console.WriteLine($"Cleaning {this.Options.Root} with entries ({all.Count}) for {(DateTime.UtcNow - start).TotalMilliseconds}ms as {freeSize.ToKMBString()} < {this.Options.MinSize.ToKMBString()}.");
                     }
                 }
             }
@@ -204,39 +208,62 @@ public class BaseDiskCache
         }
     }
 
-    async Task GetFileStats()
+    private void DeletePath(FileInfo file)
     {
+        var parent = file.Directory;
+        file.Delete();
+        for(;;)
+        {
+            if (parent == null)
+            {
+                break;
+            }
+            if (parent.FullName == this.folder)
+            {
+                break;
+            }
+            var hasAny = parent.EnumerateFileSystemInfos().Any();
+            if (hasAny)
+            {
+                break;
+            }
+            parent.Delete();
+            parent = parent.Parent;
+        }
     }
 
-    private async Task<List<(string path, long size, long time)>> GetFileStatsAsync()
+    private List<(DateTime time, FileInfo file, long size)> GetFileStatsAsync()
     {
-        var min = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - this.MinAge * this.KeepTTLSeconds * 1000;
-        var files = new List<(string path, long size, long time)>();
+        var min = DateTime.Now - (this.Options.MinAge * TimeSpan.FromSeconds(this.Options.KeepTTLSeconds));
+        var files = new List<(DateTime, FileInfo file, long size)>();
 
+        var directoryInfo = new DirectoryInfo(this.Options.Root);
         try
         {
-            var directoryInfo = new DirectoryInfo(this.Root);
-            var filesInfo = directoryInfo.GetFiles("*", SearchOption.AllDirectories);
 
-            foreach (var file in filesInfo)
+            foreach (var entry in directoryInfo.EnumerateFileSystemInfos("*", SearchOption.AllDirectories))
             {
-                var time = file.CreationTimeUtc.Ticks / TimeSpan.TicksPerMillisecond;
+                if (entry is not FileInfo file)
+                {
+                    continue;
+                }
+                var time = file.LastWriteTimeUtc;
 
                 if (time > min)
                 {
                     continue;
                 }
 
-                files.Add((path: file.FullName, size: file.Length, time: time));
+                files.Add((time, file, file.Length));
             }
         }
         catch (Exception ex)
         {
-            // Handle exceptions appropriately
-            Console.Error.WriteLine(ex);
+            Console.WriteLine(ex);
         }
 
         return files;
+
     }
 
 }
